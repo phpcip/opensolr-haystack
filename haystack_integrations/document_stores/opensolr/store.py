@@ -77,6 +77,37 @@ def _filters_to_fq(filters: Optional[Dict[str, Any]]) -> List[str]:
     return [_cond(filters)]
 
 
+
+
+def _build_ingest_doc(index: str, text: str, metadata: dict, doc_id: str):
+    """Build one Data Ingestion API document. Returns (doc, solr_id)."""
+    import hashlib
+    from urllib.parse import quote
+
+    meta = dict(metadata or {})
+    uri = meta.get("uri") or meta.get("url")
+    if not (isinstance(uri, str) and uri.startswith(("http://", "https://"))):
+        uri = f"https://ingest.opensolr.com/{index}/{quote(str(doc_id), safe='')}"
+    uri = uri.rstrip("/")
+    text = text or " "
+    solr_doc = {
+        "uri": uri,
+        "title": str(meta.get("title") or text[:100] or uri)[:250],
+        "description": str(meta.get("description") or text[:200]),
+        "text": text,
+        "meta_ext_id": str(doc_id),
+        "meta_lc_json": json.dumps(meta, ensure_ascii=False),
+    }
+    if meta.get("rtf"):
+        solr_doc["rtf"] = True
+    if meta.get("timestamp"):
+        solr_doc["timestamp"] = meta["timestamp"]
+    for key, value in meta.items():
+        if isinstance(value, (str, int, float, bool)) and key not in ("rtf", "uri", "url"):
+            solr_doc[_meta_field(str(key))] = str(value)
+    return solr_doc, hashlib.md5(uri.encode()).hexdigest()
+
+
 class OpensolrDocumentStore:
     """Haystack DocumentStore backed by a managed Opensolr vector index.
 
@@ -96,12 +127,14 @@ class OpensolrDocumentStore:
         api_key: Secret = Secret.from_env_var("OPENSOLR_API_KEY"),
         create_if_missing: bool = False,
         location: str = "us",
+        ingest_wait: bool = True,
     ) -> None:
         self.index = index
         self.email = email
         self.api_key = api_key
         self.create_if_missing = create_if_missing
         self.location = location
+        self.ingest_wait = ingest_wait
         self._client: Optional[OpensolrClient] = None
         self._checked = False
 
@@ -150,8 +183,9 @@ class OpensolrDocumentStore:
         if isinstance(content, list):
             content = " ".join(str(c) for c in content)
         score = solr_doc.get("score")
+        ext = _flat(solr_doc.get("meta_ext_id"))
         return Document(
-            id=str(_flat(solr_doc.get("id", ""))),
+            id=str(ext) if ext else str(_flat(solr_doc.get("id", ""))),
             content=str(content),
             meta=meta,
             score=float(_flat(score)) if score is not None else None,
@@ -186,12 +220,16 @@ class OpensolrDocumentStore:
             ids = [d.id for d in documents]
             joined = " OR ".join(f'"{_escape(i)}"' for i in ids)
             body = self.client.solr_select(
-                self.index, {"q": f"id:({joined})", "rows": len(ids), "fl": "id"}
+                self.index,
+                {"q": f"id:({joined}) OR meta_ext_id:({joined})", "rows": max(len(ids), 10), "fl": "id,meta_ext_id"},
             )
-            existing = {
-                str(d["id"][0] if isinstance(d["id"], list) else d["id"])
-                for d in body["response"]["docs"]
-            }
+            existing = set()
+            for d in body["response"]["docs"]:
+                for f in ("id", "meta_ext_id"):
+                    v = d.get(f)
+                    v = v[0] if isinstance(v, list) else v
+                    if v:
+                        existing.add(str(v))
             if existing and policy == DuplicatePolicy.FAIL:
                 from haystack.document_stores.errors import DuplicateDocumentError
 
@@ -200,37 +238,25 @@ class OpensolrDocumentStore:
             if not documents:
                 return 0
 
-        texts = [d.content or " " for d in documents]
-        embeddings: List[Optional[List[float]]] = [d.embedding for d in documents]
-        missing = [i for i, e in enumerate(embeddings) if e is None]
-        if missing:
-            computed = self.client.batch_embed(self.index, [texts[i] for i in missing])
-            for i, vec in zip(missing, computed):
-                embeddings[i] = vec
-
         docs = []
-        for doc, text, vector in zip(documents, texts, embeddings):
-            meta = dict(doc.meta or {})
-            solr_doc: Dict[str, Any] = {
-                "id": doc.id,
-                "text": text,
-                "embeddings": vector,
-                "meta_lc_json": json.dumps(meta, ensure_ascii=False),
-                "title": str(meta.get("title") or text[:100]),
-            }
-            for key, value in meta.items():
-                if isinstance(value, (str, int, float, bool)):
-                    solr_doc[_meta_field(str(key))] = str(value)
+        for doc in documents:
+            text = doc.content or " "
+            solr_doc, _sid = _build_ingest_doc(self.index, text, doc.meta or {}, doc.id)
             docs.append(solr_doc)
 
-        self.client.solr_update(self.index, docs)
+        for i in range(0, len(docs), 50):
+            self.client.ingest(self.index, docs[i : i + 50], wait=self.ingest_wait)
         return len(docs)
 
     def delete_documents(self, document_ids: List[str]) -> None:
         if not document_ids:
             return
         self._ensure_index()
-        self.client.solr_update(self.index, {"delete": list(document_ids)})
+        joined = " OR ".join(f'"{_escape(str(i))}"' for i in document_ids)
+        self.client.solr_update(
+            self.index,
+            {"delete": {"query": f"id:({joined}) OR meta_ext_id:({joined})"}},
+        )
 
     # ------------------------------------------------------------------ #
     # search (used by the retriever component)                           #
@@ -243,13 +269,22 @@ class OpensolrDocumentStore:
         hybrid: bool = True,
         alpha: float = 0.5,
         filters: Optional[Dict[str, Any]] = None,
+        lexical: bool = False,
     ) -> List[Document]:
         self._ensure_index()
+        params: Dict[str, Any] = {"rows": top_k, "fl": "*,score"}
+        if lexical:
+            clean = query.replace("{", " ").replace("}", " ").replace('"', " ")
+            params["q"] = f'{{!edismax qf="title^100 description^20 text^1"}}{clean}'
+            fq = _filters_to_fq(filters)
+            if fq:
+                params["fq"] = fq
+            body = self.client.solr_select(self.index, params)
+            return [self._doc_from_solr(d) for d in body["response"]["docs"]]
+
         vector = self.client.embed(self.index, query, is_query=True)
         compact = json.dumps(vector, separators=(",", ":"))
         knn = f"{{!knn f=embeddings topK={max(top_k, 10)}}}{compact}"
-
-        params: Dict[str, Any] = {"rows": top_k, "fl": "*,score"}
         if hybrid:
             clean = query.replace("{", " ").replace("}", " ").replace('"', " ")
             params["q"] = (

@@ -37,12 +37,14 @@ class OpensolrHybridRetriever:
         hybrid: bool = True,
         alpha: float = 0.5,
         filters: Optional[Dict[str, Any]] = None,
+        lexical: bool = False,
     ) -> None:
         self.document_store = document_store
         self.top_k = top_k
         self.hybrid = hybrid
         self.alpha = alpha
         self.filters = filters
+        self.lexical = lexical
 
     @component.output_types(documents=List[Document])
     def run(
@@ -52,14 +54,17 @@ class OpensolrHybridRetriever:
         hybrid: Optional[bool] = None,
         alpha: Optional[float] = None,
         filters: Optional[Dict[str, Any]] = None,
+        lexical: Optional[bool] = None,
     ) -> Dict[str, List[Document]]:
-        """Run the retriever. ``alpha``: 0 = all semantic, 1 = all lexical."""
+        """Run the retriever. ``alpha``: 0 = all semantic, 1 = all lexical.
+        ``lexical=True`` = pure keyword search, no embedding call."""
         docs = self.document_store.search(
             query=query,
             top_k=top_k if top_k is not None else self.top_k,
             hybrid=hybrid if hybrid is not None else self.hybrid,
             alpha=alpha if alpha is not None else self.alpha,
             filters=filters if filters is not None else self.filters,
+            lexical=lexical if lexical is not None else self.lexical,
         )
         return {"documents": docs}
 
@@ -71,6 +76,7 @@ class OpensolrHybridRetriever:
             hybrid=self.hybrid,
             alpha=self.alpha,
             filters=self.filters,
+            lexical=self.lexical,
         )
 
     @classmethod
