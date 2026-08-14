@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opensolr-haystack"
-version = "0.2.1"
+version = "0.2.2"
 description = "Haystack integration for Opensolr — managed Apache Solr DocumentStore with server-side embeddings and hybrid BM25+kNN retrieval"
 readme = "README.md"
 license = { text = "MIT" }

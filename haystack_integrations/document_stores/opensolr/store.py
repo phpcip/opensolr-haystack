@@ -248,6 +248,32 @@ class OpensolrDocumentStore:
             self.client.ingest(self.index, docs[i : i + 50], wait=self.ingest_wait)
         return len(docs)
 
+    def ai_answer(
+        self,
+        query: str,
+        filters: Optional[Dict[str, Any]] = None,
+        rag_docs: int = 3,
+        rag_words: int = 1500,
+        instruction: Optional[str] = None,
+        **kwargs: Any,
+    ) -> str:
+        """Grounded RAG answer generated only from this index's content.
+
+        Two-step pattern: hybrid (BM25 + kNN) retrieval picks the top
+        ``rag_docs`` hits (first ``rag_words`` words of text each), whose
+        title/description/text become the LLM context — the same pipeline as
+        Opensolr's hosted search UI. Pass ``instruction`` to fully control
+        the prompt (e.g. "Answer in German, cite the sources you used").
+        Returns plain text.
+        """
+        fqs = _filters_to_fq(filters)
+        fq = " AND ".join(f"({f})" for f in fqs) if fqs else None
+        return self.client.ai_summary(
+            self.index, query, filter_query=fq,
+            rag_docs=rag_docs, rag_words=rag_words, instruction=instruction,
+            **kwargs,
+        )
+
     def delete_documents(self, document_ids: List[str]) -> None:
         if not document_ids:
             return
