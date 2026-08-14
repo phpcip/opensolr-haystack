@@ -4,6 +4,8 @@
 [Opensolr](https://opensolr.com) — managed Apache Solr as a DocumentStore,
 with **server-side embeddings** and native **hybrid (BM25 + kNN) retrieval**.
 
+**See it live (real news index, hybrid + AI answer):** https://search.opensolr.com/news__dense?q=how+am+I+supposed+to+save+money%3F
+
 No embedder components needed in your pipeline — texts and queries are
 embedded on Opensolr's GPU infrastructure (multilingual E5-large-instruct,
 1024 dimensions, cosine).
