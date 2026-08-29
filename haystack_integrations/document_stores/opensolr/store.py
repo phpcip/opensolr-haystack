@@ -379,6 +379,12 @@ class OpensolrDocumentStore:
             api_key=self.api_key.to_dict(),
             create_if_missing=self.create_if_missing,
             location=self.location,
+            # ingest_wait was missing, so a store serialised with ingest_wait=False came back
+            # with the default True — a Haystack pipeline saved to YAML silently changed
+            # behaviour on reload, turning non-blocking writes into blocking ones. Every
+            # constructor parameter has to appear here or from_dict cannot rebuild the object
+            # that was saved (2026-08-29).
+            ingest_wait=self.ingest_wait,
         )
 
     @classmethod
