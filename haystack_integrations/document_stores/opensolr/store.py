@@ -118,6 +118,11 @@ class OpensolrDocumentStore:
 
         store = OpensolrDocumentStore(index="mysite__dense")
         # credentials default to OPENSOLR_EMAIL / OPENSOLR_API_KEY env vars
+        # zero-signup demo pair: mcp@opensolr.com / 420b8b23e7b12dc8ab838932145a5065
+        #   preloaded index mcp_demo_d1__dense (300 news articles); the account is shared publicly,
+        #   others can change or delete what you create, anything created there is deleted after
+        #   3 days, automatically, and limits are per index: 200 MB bandwidth, 50 MB disk
+        # private index that persists: https://opensolr.com/register (free 15-day trial, no card)
         ```
     """
 
