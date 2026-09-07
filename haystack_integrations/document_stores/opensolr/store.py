@@ -7,6 +7,8 @@ local embedder component needed at indexing time.
 
 from __future__ import annotations
 
+import base64
+from pathlib import Path
 import json
 import re
 from typing import Any, Dict, List, Optional
@@ -375,6 +377,66 @@ class OpensolrDocumentStore:
     # ------------------------------------------------------------------ #
     # serialization                                                      #
     # ------------------------------------------------------------------ #
+
+    def image_to_words(self, image, top_k: int = 8) -> Dict[str, Any]:
+        """Read an image and return what it was turned into, without searching yet.
+
+        Returns ``{"text", "mode", "labels", "codes"}``: the best words to search
+        with, whether it was read as visual labels ("clip") or OCR text ("ocr"),
+        the CLIP visual labels (present even in OCR mode), and any barcodes / QR codes.
+        ``image`` is a file path (str/Path) or raw image bytes.
+        """
+        raw = bytes(image) if isinstance(image, (bytes, bytearray)) else Path(image).read_bytes()
+        b64 = base64.b64encode(raw).decode("ascii")
+        ans = self.client.image_to_text(self._index, b64, top_k=top_k)
+        labels = [l["label"] for l in (ans.get("labels") or []) if isinstance(l, dict) and l.get("label")]
+        codes = []
+        for c in (ans.get("codes") or []):
+            text = c.get("text") if isinstance(c, dict) else (c if isinstance(c, str) else None)
+            if text:
+                codes.append(text)
+        return {"text": (ans.get("text") or "").strip(), "mode": ans.get("mode") or "clip", "labels": labels, "codes": codes}
+
+    def search_by_image(
+        self,
+        image,
+        top_k: int = 10,
+        using: str = "auto",
+        filters: Optional[Dict[str, Any]] = None,
+        image_top_k: int = 8,
+        **search_kwargs,
+    ) -> List[Document]:
+        """Search the index with a photo instead of a text query.
+
+        The image is turned into words by :meth:`image_to_words`, then those words
+        run through the normal :meth:`search`, so ``hybrid``, ``lexical``, ``alpha``
+        and ``fresh_bias`` apply via ``search_kwargs``. No image vector is stored.
+
+        ``using``: which reading to search with — ``"auto"`` (the engine's chosen
+        text), ``"meaning"`` (CLIP visual labels), ``"text"`` (OCR text only), or
+        ``"code"`` (the first barcode / QR code), or ``"all"`` (labels + OCR text + barcodes combined).
+        """
+        read = self.image_to_words(image, top_k=image_top_k)
+        if using == "meaning":
+            query = ", ".join(read["labels"])
+        elif using == "text":
+            query = read["text"] if read["mode"] == "ocr" else ""
+        elif using == "code":
+            query = read["codes"][0] if read["codes"] else ""
+            search_kwargs.setdefault("lexical", True)
+        elif using == "all":
+            parts = list(read["labels"])
+            if read["mode"] == "ocr" and read["text"]:
+                parts.append(read["text"])
+            parts.extend(read["codes"])
+            query = ", ".join(p for p in parts if p)
+        elif using == "auto":
+            query = read["text"]
+        else:
+            raise ValueError("using must be one of 'auto', 'meaning', 'text', 'code', 'all'")
+        if not query:
+            return []
+        return self.search(query, top_k=top_k, filters=filters, **search_kwargs)
 
     def to_dict(self) -> Dict[str, Any]:
         return default_to_dict(

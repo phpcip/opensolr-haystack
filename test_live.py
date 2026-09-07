@@ -955,6 +955,27 @@ def main() -> int:
         check("store.search(lexical=True) → keyword hits with content and score",
               t_search_lexical)
 
+        _IMG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_image.jpg")
+
+        def t_image_to_words():
+            read = demo_store.image_to_words(_IMG)
+            assert isinstance(read, dict), read
+            assert isinstance(read.get("text"), str) and read["text"].strip(), "no words from image"
+            assert read.get("mode") in ("clip", "ocr"), read.get("mode")
+            assert isinstance(read.get("labels"), list) and isinstance(read.get("codes"), list)
+            return "read as %s: %r, %d labels" % (read["mode"], read["text"][:40], len(read["labels"]))
+
+        check("store.image_to_words turns a photo into text/labels/codes", t_image_to_words)
+
+        def t_search_by_image():
+            docs = demo_store.search_by_image(_IMG, top_k=3)
+            assert isinstance(docs, list), docs
+            for d in docs:
+                assert isinstance(d, Document)
+            return "%d Document(s) from the picture" % len(docs)
+
+        check("store.search_by_image searches the index with a photo", t_search_by_image)
+
         def t_search_hybrid():
             docs = demo_store.search("melting glaciers in the alps", top_k=4)
             assert docs, "no hybrid hits"

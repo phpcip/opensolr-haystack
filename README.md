@@ -127,6 +127,31 @@ Don't need vectors? Pure keyword search skips the embedding call entirely —
 zero AI quota, and it works on **any** Opensolr index, including non-vector
 ones and older Solr versions.
 
+## Search by image
+
+Search your index with a **photo** instead of a text query. Opensolr reads the
+picture three ways — visual labels (what it depicts), OCR text (words printed on
+it), and any barcode / QR code — and turns that into an ordinary search. Nothing
+new is stored in Solr; the picture simply becomes words.
+
+```python
+# What the picture reads as (labels, OCR text, barcodes) — no search yet:
+read = store.image_to_words("photo.jpg")   # path, bytes, or base64
+# {'text': 'red running shoe', 'mode': 'clip',
+#  'labels': ['running shoe', 'sneaker'], 'codes': ['0123456789012']}
+
+# Search the index with the picture:
+docs = store.search_by_image("photo.jpg", top_k=4)          # engine picks the best reading
+docs = store.search_by_image("photo.jpg", using="meaning")  # visual labels
+docs = store.search_by_image("photo.jpg", using="text")     # only OCR text
+docs = store.search_by_image("photo.jpg", using="code")     # exact barcode / QR match
+docs = store.search_by_image("photo.jpg", using="all")      # labels + OCR + codes
+```
+
+`search_by_image` forwards the same tuning as `search` — `hybrid`, `lexical`,
+`alpha`, `fresh_bias`, `filters` — so an image query runs through the exact
+hybrid pipeline a text query does.
+
 ## Your index schema
 
 Documents follow the Opensolr document model (`title`, `description`, `text`,
