@@ -124,7 +124,7 @@ class OpensolrDocumentStore:
         #   preloaded index mcp_demo_d1__dense (300 news articles); the account is shared publicly,
         #   others can change or delete what you create, anything created there is deleted after
         #   3 days, automatically, and limits are per index: 200 MB bandwidth, 50 MB disk
-        # private index that persists: https://opensolr.com/register (free 15-day trial, no card)
+        # private index that persists: https://opensolr.com/register (free forever, no card)
         ```
     """
 
