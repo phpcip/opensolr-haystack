@@ -40,6 +40,7 @@ import collections
 import json
 import math
 import os
+import re
 import random
 import sys
 import time
@@ -59,6 +60,7 @@ API_KEY = "420b8b23e7b12dc8ab838932145a5065"
 os.environ["OPENSOLR_EMAIL"] = EMAIL
 os.environ["OPENSOLR_API_KEY"] = API_KEY
 
+OPS_QUERY = "melting glaciers in the alps"
 DEMO_INDEX = "mcp_demo_d1__dense"
 #: The __dense suffix is REQUIRED — it is what marks an index vector-enabled
 #: across the whole platform. Random suffix so two runs (or two agents) never
@@ -285,10 +287,13 @@ def main() -> int:
         FRESH_BIAS_FUNCTION,
         OpensolrClient,
         OpensolrError,
+        SEARCH_OPERATOR_FIELDS,
         VECTOR_LOCATIONS,
         apply_fresh_bias,
+        apply_search_operators,
         build_context,
         build_instruction,
+        parse_operators,
         resolve_location,
     )
 
@@ -329,6 +334,50 @@ def main() -> int:
 
         check("apply_fresh_bias wraps q in {!boost} with the recency function",
               t_fresh_bias)
+
+        def t_parse_operators():
+            cases = {
+                "did juventus win that match? -Ruben":
+                    ("did juventus win that match?", [], ["Ruben"]),
+                '+laptop +"13 inch" -refurbished':
+                    ("", ["laptop", '"13 inch"'], ["refurbished"]),
+                'laptop -"open box" gaming':
+                    ("laptop gaming", [], ['"open box"']),
+                # a '-' mid-token is part of the word, not an operator
+                "e-mail covid-19 1+1 formula": ("e-mail covid-19 1+1 formula", [], []),
+                # a '-' INSIDE a quoted phrase belongs to the phrase
+                '"foo -bar" baz': ('"foo -bar" baz', [], []),
+                # a lone sign, or an empty operand, is plain text
+                'cafea + - fara +"" zahar': ('cafea + - fara +"" zahar', [], []),
+            }
+            for raw, (base, req, exc) in cases.items():
+                got = parse_operators(raw)
+                assert got["base"] == base, (raw, got["base"], base)
+                assert got["required"] == req, (raw, got["required"], req)
+                assert got["excluded"] == exc, (raw, got["excluded"], exc)
+                assert got["has_ops"] == bool(req or exc), (raw, got["has_ops"])
+            return "%d queries split exactly, hyphenated words and quoted '-' left alone" % len(cases)
+
+        check("parse_operators splits +/- operators and leaves ordinary text alone",
+              t_parse_operators)
+
+        def t_apply_search_operators():
+            params = {"q": "{!hybrid}", "fq": ["meta_kind:news"]}
+            out = apply_search_operators(params, parse_operators('news +"press release" -rumour'))
+            assert out is params, "must mutate and return the same dict"
+            assert params["reqQ0"] == '"press release"', params.get("reqQ0")
+            assert params["negQ0"] == "rumour", params.get("negQ0")
+            want_req = '{!edismax qf="%s" mm="100%%" v=$reqQ0}' % SEARCH_OPERATOR_FIELDS
+            want_neg = '-{!edismax qf="%s" mm="100%%" v=$negQ0}' % SEARCH_OPERATOR_FIELDS
+            assert want_req in params["fq"], params["fq"]
+            assert want_neg in params["fq"], params["fq"]
+            assert "meta_kind:news" in params["fq"], "a pre-existing fq must survive"
+            assert params["q"] == "{!hybrid}", "q must be untouched"
+            return "operands bound by reference, both filters added, existing fq kept"
+
+        check("apply_search_operators emits fq filters and keeps existing ones",
+              t_apply_search_operators)
+
 
         def t_build_context():
             docs = [
@@ -987,6 +1036,82 @@ def main() -> int:
 
         check("store.search(hybrid=True) → fused hits with content and score",
               t_search_hybrid)
+
+        def _ops_fixture():
+            """Pick a real word and adjacent word pair out of the top hybrid hit.
+
+            The demo corpus is not ours to hardcode, so the term to exclude comes from the
+            corpus itself. Excluding it MUST drop that document; requiring it must keep it.
+            """
+            if "ops_fixture" in state:
+                return state["ops_fixture"]
+            docs = demo_store.search(OPS_QUERY, top_k=1)
+            assert docs, "baseline hybrid search returned nothing to build a fixture from"
+            body = docs[0].content or ""
+            words = re.findall(r"[A-Za-z]{6,}", body)
+            pair = re.search(r"([A-Za-z]{5,})\s+([A-Za-z]{5,})", body)
+            assert words and pair, "top document has too little text: %r" % body[:80]
+            state["ops_fixture"] = {"id": docs[0].id, "word": words[0],
+                                    "phrase": "%s %s" % (pair.group(1), pair.group(2))}
+            return state["ops_fixture"]
+
+        def t_ops_exclude_word():
+            fx = _ops_fixture()
+            ids = [d.id for d in demo_store.search("%s -%s" % (OPS_QUERY, fx["word"]), top_k=10)]
+            assert fx["id"] not in ids, (
+                "-%s did not remove the document containing it (%d results)" % (fx["word"], len(ids)))
+            return "-%s removed its document from %d hybrid results" % (fx["word"], len(ids))
+
+        check("-word excludes in hybrid mode, where the vector leg used to smuggle it back",
+              t_ops_exclude_word)
+
+        def t_ops_require_word():
+            fx = _ops_fixture()
+            ids = [d.id for d in demo_store.search("%s +%s" % (OPS_QUERY, fx["word"]), top_k=20)]
+            assert ids, "+%s returned nothing at all" % fx["word"]
+            assert fx["id"] in ids, "+%s dropped the document that does contain it" % fx["word"]
+            return "+%s kept its document, %d results" % (fx["word"], len(ids))
+
+        check("+word is genuinely required in hybrid mode", t_ops_require_word)
+
+        def t_ops_exclude_phrase():
+            fx = _ops_fixture()
+            ids = [d.id for d in demo_store.search('%s -"%s"' % (OPS_QUERY, fx["phrase"]), top_k=10)]
+            assert fx["id"] not in ids, (
+                '-"%s" did not remove the document containing that exact phrase' % fx["phrase"])
+            return '-"%s" removed its document from %d results' % (fx["phrase"], len(ids))
+
+        check('-"phrase" excludes an exact phrase in hybrid mode', t_ops_exclude_phrase)
+
+        def t_ops_require_phrase():
+            fx = _ops_fixture()
+            ids = [d.id for d in demo_store.search('%s +"%s"' % (OPS_QUERY, fx["phrase"]), top_k=20)]
+            assert ids, '+"%s" returned nothing at all' % fx["phrase"]
+            assert fx["id"] in ids, '+"%s" dropped the document containing that phrase' % fx["phrase"]
+            return '+"%s" kept its document, %d results' % (fx["phrase"], len(ids))
+
+        check('+"phrase" requires an exact phrase in hybrid mode', t_ops_require_phrase)
+
+        def t_ops_only_query():
+            fx = _ops_fixture()
+            ids = [d.id for d in demo_store.search("-%s" % fx["word"], top_k=5)]
+            assert ids, "a query made of nothing but an exclusion must still return documents"
+            assert fx["id"] not in ids, "the excluded document came back on the operators-only path"
+            return "'-%s' alone falls back to keyword search and still excludes, %d results" % (
+                fx["word"], len(ids))
+
+        check("a query that is nothing but operators still works and still excludes",
+              t_ops_only_query)
+
+        def t_ops_are_not_syntax():
+            # The operand is bound by reference, so Solr local params inside it stay text.
+            docs = demo_store.search(
+                OPS_QUERY + ' -{!join fromIndex=mcp_demo_d1__dense}x', top_k=3)
+            assert isinstance(docs, list), docs
+            return "a '{!join}' operand stayed literal text, %d normal results" % len(docs)
+
+        check("an operand containing Solr local params is treated as text, not syntax",
+              t_ops_are_not_syntax)
 
         def t_search_knn():
             docs = demo_store.search("melting glaciers in the alps", top_k=4,
