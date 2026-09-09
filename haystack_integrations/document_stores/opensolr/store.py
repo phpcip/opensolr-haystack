@@ -21,6 +21,8 @@ from haystack_integrations.document_stores.opensolr.client import (
     OpensolrClient,
     OpensolrError,
     apply_fresh_bias,
+    apply_search_operators,
+    parse_operators,
 )
 
 _META_KEY_RE = re.compile(r"[^a-z0-9_]+")
@@ -32,6 +34,26 @@ def _meta_field(key: str) -> str:
 
 def _escape(value: Any) -> str:
     return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _extend_fq(params: Dict[str, Any], extra: List[str]) -> Dict[str, Any]:
+    """Append filters to ``params["fq"]``, never replace what is already there.
+
+    The search paths put filters in ``params`` before the caller's own metadata filters are
+    added — the search-operator filters, and Fresh Results Bias's "must have a creation_date"
+    clause. A plain ``params["fq"] = fq`` silently dropped both the moment a caller also
+    passed ``filters``, so every write goes through here instead.
+    """
+    if not extra:
+        return params
+    existing = params.get("fq")
+    if existing is None:
+        params["fq"] = list(extra)
+    elif isinstance(existing, list):
+        params["fq"] = existing + list(extra)
+    else:
+        params["fq"] = [existing] + list(extra)
+    return params
 
 
 def _filters_to_fq(filters: Optional[Dict[str, Any]]) -> List[str]:
@@ -335,41 +357,57 @@ class OpensolrDocumentStore:
         """
         self._ensure_index()
         params: Dict[str, Any] = {"rows": top_k, "fl": "*,score"}
-        if lexical:
-            clean = query.replace("{", " ").replace("}", " ").replace('"', " ")
-            params["q"] = f'{{!edismax qf="title^100 description^20 text^1"}}{clean}'
+        # Search operators (+word, -word, +"phrase", -"phrase") come out of the text once,
+        # for every shape below. See parse_operators() for why they cannot stay inside the
+        # query on any path that involves a vector.
+        ops = parse_operators(query)
+        # Nothing left once the operators are removed ("-Ruben" alone): the operators ARE the
+        # query. Hand the whole string to edismax, which understands them natively, and emit
+        # no filters.
+        ops_only = ops["has_ops"] and len(ops["base"]) < 2
+        lexical_text = query if (not ops["has_ops"] or ops_only) else ops["base"]
+
+        if lexical or ops_only:
+            # Bound by reference (2026-09-09) instead of inlined: inlining meant a '}' in the
+            # caller's text closed the local-param block, which is why braces AND quotes were
+            # stripped first — and stripping the quotes silently broke every phrase query.
+            params["uq"] = lexical_text
+            params["q"] = '{!edismax qf="title^100 description^20 text^1" v=$uq}'
             # Wrapped rather than set as an edismax `bf`: edismax is invoked here
             # through local params inside q, not as the request's defType, so a
             # top-level bf is not reliably its own.
             if fresh_bias:
                 apply_fresh_bias(params)
-            fq = _filters_to_fq(filters)
-            if fq:
-                params["fq"] = fq
+            _extend_fq(params, _filters_to_fq(filters))
             body = self.client.solr_select(self.index, params)
             return [self._doc_from_solr(d) for d in body["response"]["docs"]]
 
-        vector = self.client.embed(self.index, query, is_query=True)
+        # The embedder must never see an operator — it has no concept of negation, so a '-'
+        # term reads as one more word and pulls results towards what the caller asked to drop.
+        vector = self.client.embed(
+            self.index, ops["base"] if ops["has_ops"] else query, is_query=True
+        )
         compact = json.dumps(vector, separators=(",", ":"))
         knn = f"{{!knn f=embeddings topK={max(top_k, 10)}}}{compact}"
         if hybrid:
-            clean = query.replace("{", " ").replace("}", " ").replace('"', " ")
+            params["uq"] = lexical_text
             params["q"] = (
                 f"{{!hybrid lexical=$lexicalRaw vector=$vectorQuery "
                 f"mode=union alpha={alpha} topN={max(top_k, 10)}}}"
             )
-            params["lexicalRaw"] = f'{{!edismax qf="title^100 text^1"}}{clean}'
+            params["lexicalRaw"] = '{!edismax qf="title^100 text^1" v=$uq}'
             params["vectorQuery"] = knn
         else:
             params["q"] = knn
+        # Operators become filters on both vector-bearing shapes. On the pure-kNN shape this
+        # is the only thing that can honour them at all — that query has no edismax in it.
+        apply_search_operators(params, ops)
         # Fresh Results Bias wraps whichever shape was just built — fused {!hybrid}
         # or bare {!knn} — so the recency multiplier reaches every candidate,
         # including the vector-only ones an edismax bf never sees.
         if fresh_bias:
             apply_fresh_bias(params)
-        fq = _filters_to_fq(filters)
-        if fq:
-            params["fq"] = fq
+        _extend_fq(params, _filters_to_fq(filters))
 
         body = self.client.solr_select(self.index, params)
         return [self._doc_from_solr(d) for d in body["response"]["docs"]]
