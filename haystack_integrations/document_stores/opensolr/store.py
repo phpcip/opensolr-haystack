@@ -1,6 +1,7 @@
 """Opensolr DocumentStore for Haystack.
 
-Managed, vector-enabled Apache Solr 9.x (knn_vector 1024-dim, cosine) with
+Managed, vector-enabled Apache Solr (an index in a vector region: a server with
+the Opensolr web crawler; knn_vector 1024-dim, cosine) with
 embeddings computed **server-side** on Opensolr's GPU infrastructure — no
 local embedder component needed at indexing time.
 """
