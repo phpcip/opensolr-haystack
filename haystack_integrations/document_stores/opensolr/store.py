@@ -217,15 +217,16 @@ class OpensolrDocumentStore:
         score = solr_doc.get("score")
         ext = _flat(solr_doc.get("meta_ext_id"))
         doc_id = str(ext) if ext else str(_flat(solr_doc.get("id", "")))
-        # Where the hit lives: uri; a page of a PDF adds page_number, page_url, document_id, more_pages
+        # A page of a PDF also says where it lives (uri, page_number, page_url, document_id, more_pages);
+        # any other document keeps exactly the meta it was sent with
         where = page_info(solr_doc, expanded)
         if where.get("page"):
             where["page_number"] = where.pop("page")
             # every page of a PDF carries the PDF's meta_ext_id: the page number keeps ids apart
             doc_id = f"{doc_id}#page={where['page_number']}"
-        for key, value in where.items():
-            if value not in ("", None):
-                meta.setdefault(key, value)
+            for key, value in where.items():
+                if value not in ("", None):
+                    meta.setdefault(key, value)
         return Document(
             id=doc_id,
             content=str(content),
@@ -289,6 +290,26 @@ class OpensolrDocumentStore:
         for i in range(0, len(docs), 50):
             self.client.ingest(self.index, docs[i : i + 50], wait=self.ingest_wait)
         return len(docs)
+
+    def check_schema(self) -> Dict[str, Any]:
+        """Whether this index is ready for every feature of the store, and exactly why not.
+
+        Returns the platform's check: ``ready``, ``capabilities`` (``ingestion``,
+        ``vector_search``, ``pdf_pages``, ``keyword_search``), the server, its Solr
+        version, the fields and types that differ from the Opensolr vector schema,
+        ``problems`` and ``fix``. The store runs this check once on its own.
+        """
+        self._ensure_index()
+        return self.client.check_schema(self.index)
+
+    def apply_schema(self, force: bool = False) -> Dict[str, Any]:
+        """Install the Opensolr vector schema on this index (an index of a vector region).
+
+        It replaces the index configuration; an index that already holds documents needs
+        ``force=True``, and those documents must be sent again. Returns the new check.
+        """
+        self._ensure_index()
+        return self.client.apply_schema(self.index, force=force)
 
     def write_files(
         self,
@@ -402,7 +423,7 @@ class OpensolrDocumentStore:
         dated in that period (``creation_date``). ``group_pages`` (on by default) returns
         a PDF indexed page by page once, as its best page: ``meta`` carries
         ``page_number``, ``page_url`` (opens the PDF at that page), ``document_id`` and
-        ``more_pages`` (its other matching pages). Every document carries ``uri``.
+        ``more_pages`` (its other matching pages) and its ``uri``.
         """
         self._ensure_index()
         params: Dict[str, Any] = {"rows": top_k, "fl": "*,score"}
@@ -434,6 +455,8 @@ class OpensolrDocumentStore:
             expanded = body.get("expanded") or {}
             return [self._doc_from_solr(d, expanded) for d in body["response"]["docs"]]
 
+        # An index without the vector fields says so before an embedding is paid for
+        self.client.require_capability(self.index, "vector_search")
         # The embedder must never see an operator — it has no concept of negation, so a '-'
         # term reads as one more word and pulls results towards what the caller asked to drop.
         vector = self.client.embed(
