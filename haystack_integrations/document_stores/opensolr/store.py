@@ -11,7 +11,7 @@ import base64
 from pathlib import Path
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from haystack import Document, default_from_dict, default_to_dict
 from haystack.document_stores.types import DuplicatePolicy
@@ -22,6 +22,8 @@ from haystack_integrations.document_stores.opensolr.client import (
     OpensolrError,
     apply_fresh_bias,
     apply_search_operators,
+    date_range_filter,
+    page_info,
     parse_operators,
 )
 
@@ -198,7 +200,7 @@ class OpensolrDocumentStore:
                     continue
         self._checked = True
 
-    def _doc_from_solr(self, solr_doc: Dict[str, Any]) -> Document:
+    def _doc_from_solr(self, solr_doc: Dict[str, Any], expanded: Optional[Dict[str, Any]] = None) -> Document:
         def _flat(v: Any) -> Any:
             return v[0] if isinstance(v, list) and len(v) == 1 else v
 
@@ -214,8 +216,18 @@ class OpensolrDocumentStore:
             content = " ".join(str(c) for c in content)
         score = solr_doc.get("score")
         ext = _flat(solr_doc.get("meta_ext_id"))
+        doc_id = str(ext) if ext else str(_flat(solr_doc.get("id", "")))
+        # Where the hit lives: uri; a page of a PDF adds page_number, page_url, document_id, more_pages
+        where = page_info(solr_doc, expanded)
+        if where.get("page"):
+            where["page_number"] = where.pop("page")
+            # every page of a PDF carries the PDF's meta_ext_id: the page number keeps ids apart
+            doc_id = f"{doc_id}#page={where['page_number']}"
+        for key, value in where.items():
+            if value not in ("", None):
+                meta.setdefault(key, value)
         return Document(
-            id=str(ext) if ext else str(_flat(solr_doc.get("id", ""))),
+            id=doc_id,
             content=str(content),
             meta=meta,
             score=float(_flat(score)) if score is not None else None,
@@ -277,6 +289,34 @@ class OpensolrDocumentStore:
         for i in range(0, len(docs), 50):
             self.client.ingest(self.index, docs[i : i + 50], wait=self.ingest_wait)
         return len(docs)
+
+    def write_files(
+        self,
+        path: Union[str, Path],
+        pattern: str = "*",
+        recursive: bool = True,
+        metadata: Optional[Dict[str, Any]] = None,
+        wait: Optional[bool] = None,
+        timeout: float = 600.0,
+    ) -> Dict[str, Any]:
+        """Index local files: one file, or every file of a folder.
+
+        Each file is read on Opensolr (its text, its pictures through OCR) and a PDF is
+        indexed one document per page, so a search finds the page that answers it.
+        Word, RTF, OpenDocument, text, HTML and picture files (scans) are one document
+        each. ``pattern`` picks a folder's files (``"*.pdf"``), ``metadata`` goes on
+        every document (filterable like any meta). Sending the same files again replaces
+        them. ``wait`` defaults to the store's ``ingest_wait``.
+
+        Returns ``{"documents", "pending", "failed", "jobs"}``: files still being read
+        when ``timeout`` ran out are under ``pending`` — call again to index them, the
+        bytes are not sent twice.
+        """
+        self._ensure_index()
+        return self.client.ingest_files(
+            self.index, path, pattern=pattern, recursive=recursive, metadata=metadata,
+            wait=self.ingest_wait if wait is None else wait, timeout=timeout,
+        )
 
     def ai_answer(
         self,
@@ -346,6 +386,9 @@ class OpensolrDocumentStore:
         filters: Optional[Dict[str, Any]] = None,
         lexical: bool = False,
         fresh_bias: bool = False,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        group_pages: bool = True,
     ) -> List[Document]:
         """Retrieve the top_k documents for a query.
 
@@ -354,9 +397,17 @@ class OpensolrDocumentStore:
         filters — the hit count is unchanged, nothing old becomes unreachable, and
         a document with no ``creation_date`` is simply left unboosted. Applies to
         the lexical, hybrid and pure-kNN paths alike. Off by default.
+
+        ``date_from`` / ``date_to`` (``YYYY-MM-DD``, both included) keep only documents
+        dated in that period (``creation_date``). ``group_pages`` (on by default) returns
+        a PDF indexed page by page once, as its best page: ``meta`` carries
+        ``page_number``, ``page_url`` (opens the PDF at that page), ``document_id`` and
+        ``more_pages`` (its other matching pages). Every document carries ``uri``.
         """
         self._ensure_index()
         params: Dict[str, Any] = {"rows": top_k, "fl": "*,score"}
+        # Checked before anything is embedded: a malformed date is the caller's, not a GPU call's
+        period = date_range_filter(date_from, date_to)
         # Search operators (+word, -word, +"phrase", -"phrase") come out of the text once,
         # for every shape below. See parse_operators() for why they cannot stay inside the
         # query on any path that involves a vector.
@@ -378,9 +429,10 @@ class OpensolrDocumentStore:
             # top-level bf is not reliably its own.
             if fresh_bias:
                 apply_fresh_bias(params)
-            _extend_fq(params, _filters_to_fq(filters))
-            body = self.client.solr_select(self.index, params)
-            return [self._doc_from_solr(d) for d in body["response"]["docs"]]
+            _extend_fq(params, _filters_to_fq(filters) + ([period] if period else []))
+            body = self.client.select_grouped(self.index, params, group_pages)
+            expanded = body.get("expanded") or {}
+            return [self._doc_from_solr(d, expanded) for d in body["response"]["docs"]]
 
         # The embedder must never see an operator — it has no concept of negation, so a '-'
         # term reads as one more word and pulls results towards what the caller asked to drop.
@@ -407,10 +459,11 @@ class OpensolrDocumentStore:
         # including the vector-only ones an edismax bf never sees.
         if fresh_bias:
             apply_fresh_bias(params)
-        _extend_fq(params, _filters_to_fq(filters))
+        _extend_fq(params, _filters_to_fq(filters) + ([period] if period else []))
 
-        body = self.client.solr_select(self.index, params)
-        return [self._doc_from_solr(d) for d in body["response"]["docs"]]
+        body = self.client.select_grouped(self.index, params, group_pages)
+        expanded = body.get("expanded") or {}
+        return [self._doc_from_solr(d, expanded) for d in body["response"]["docs"]]
 
     # ------------------------------------------------------------------ #
     # serialization                                                      #
@@ -426,7 +479,7 @@ class OpensolrDocumentStore:
         """
         raw = bytes(image) if isinstance(image, (bytes, bytearray)) else Path(image).read_bytes()
         b64 = base64.b64encode(raw).decode("ascii")
-        ans = self.client.image_to_text(self._index, b64, top_k=top_k)
+        ans = self.client.image_to_text(self.index, b64, top_k=top_k)
         labels = [l["label"] for l in (ans.get("labels") or []) if isinstance(l, dict) and l.get("label")]
         codes = []
         for c in (ans.get("codes") or []):
@@ -447,8 +500,9 @@ class OpensolrDocumentStore:
         """Search the index with a photo instead of a text query.
 
         The image is turned into words by :meth:`image_to_words`, then those words
-        run through the normal :meth:`search`, so ``hybrid``, ``lexical``, ``alpha``
-        and ``fresh_bias`` apply via ``search_kwargs``. No image vector is stored.
+        run through the normal :meth:`search`, so ``hybrid``, ``lexical``, ``alpha``,
+        ``fresh_bias``, ``date_from``, ``date_to`` and ``group_pages`` apply via
+        ``search_kwargs``. No image vector is stored.
 
         ``using``: which reading to search with — ``"auto"`` (the engine's chosen
         text), ``"meaning"`` (CLIP visual labels), ``"text"`` (OCR text only), or

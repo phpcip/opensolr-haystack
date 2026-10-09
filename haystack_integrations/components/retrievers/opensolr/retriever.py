@@ -39,6 +39,9 @@ class OpensolrHybridRetriever:
         filters: Optional[Dict[str, Any]] = None,
         lexical: bool = False,
         fresh_bias: bool = False,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        group_pages: bool = True,
     ) -> None:
         self.document_store = document_store
         self.top_k = top_k
@@ -51,6 +54,9 @@ class OpensolrHybridRetriever:
         # for a Haystack user, so an option the component does not carry is an option
         # that does not exist in a pipeline.
         self.fresh_bias = fresh_bias
+        self.date_from = date_from
+        self.date_to = date_to
+        self.group_pages = group_pages
 
     @component.output_types(documents=List[Document])
     def run(
@@ -62,13 +68,19 @@ class OpensolrHybridRetriever:
         filters: Optional[Dict[str, Any]] = None,
         lexical: Optional[bool] = None,
         fresh_bias: Optional[bool] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        group_pages: Optional[bool] = None,
     ) -> Dict[str, List[Document]]:
         """Run the retriever. ``alpha``: 0 = all semantic, 1 = all lexical.
         ``lexical=True`` = pure keyword search, no embedding call.
         ``fresh_bias=True`` biases the ranking toward recent documents by
         multiplying each score by a recency curve on ``creation_date``; it
         re-orders and never filters, so the hit count is unchanged and nothing
-        old becomes unreachable. Off by default."""
+        old becomes unreachable. Off by default.
+        ``date_from`` / ``date_to`` (``YYYY-MM-DD``) keep only documents dated in that
+        period. ``group_pages`` (on by default) returns a PDF indexed page by page once,
+        as its best page, with ``page_number``, ``page_url`` and ``more_pages`` in meta."""
         docs = self.document_store.search(
             query=query,
             top_k=top_k if top_k is not None else self.top_k,
@@ -77,6 +89,9 @@ class OpensolrHybridRetriever:
             filters=filters if filters is not None else self.filters,
             lexical=lexical if lexical is not None else self.lexical,
             fresh_bias=fresh_bias if fresh_bias is not None else self.fresh_bias,
+            date_from=date_from if date_from is not None else self.date_from,
+            date_to=date_to if date_to is not None else self.date_to,
+            group_pages=group_pages if group_pages is not None else self.group_pages,
         )
         return {"documents": docs}
 
@@ -93,6 +108,9 @@ class OpensolrHybridRetriever:
             # the bias on comes back with it on. from_dict() tolerates its absence in
             # dicts written before this option existed — the constructor defaults it.
             fresh_bias=self.fresh_bias,
+            date_from=self.date_from,
+            date_to=self.date_to,
+            group_pages=self.group_pages,
         )
 
     @classmethod
